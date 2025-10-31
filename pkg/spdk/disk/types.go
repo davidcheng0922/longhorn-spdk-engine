@@ -128,3 +128,21 @@ func isBDF(addr string) bool {
 	bdfPattern := regexp.MustCompile(bdfFormat)
 	return bdfPattern.MatchString(addr)
 }
+
+func IsDiskDriverUIOFromPath(diskPathOrBdf string) (bool, error) {
+	if !isBDF(diskPathOrBdf) {
+		return false, nil
+	}
+
+	executor, err := helperutil.NewExecutor(commontypes.ProcDirectory)
+	if err != nil {
+		return false, err
+	}
+
+	diskStatus, err := spdksetup.GetDiskStatus(diskPathOrBdf, executor)
+	if err != nil {
+		return false, err
+	}
+
+	return isUioPciGeneric(diskStatus.Driver), nil
+}

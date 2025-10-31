@@ -22,8 +22,10 @@ import (
 
 	butil "github.com/longhorn/backupstore/util"
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
+	commontypes "github.com/longhorn/go-common-libs/types"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
+	spdkdisk "github.com/longhorn/longhorn-spdk-engine/pkg/spdk/disk"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
@@ -2268,4 +2270,42 @@ func (s *Server) MetricsGet(ctx context.Context, req *spdkrpc.MetricsRequest) (r
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine metrics: %s", req.Name)
 	}
 	return m, nil
+}
+
+// cleanupDisk checks if the disk is healthy, and if not, deletes it.
+// Handles uio_pci_generic bindings where the original PCI driver (NVMe/Virtio) cannot be identified.
+func cleanupDisk(spdkClient *spdkclient.Client, diskName, diskDriver string, d *Disk) (err error) {
+	logrus.Warnf("Disk %s path %s is unhealthy: %v, try to cleanup", diskName, d.DiskPath, err)
+
+	uioDriver, uioErr := spdkdisk.IsDiskDriverUIOFromPath(d.DiskPath)
+	if uioErr != nil {
+		return errors.Wrapf(uioErr, "failed to check if disk %s uses uio driver", diskName)
+	}
+
+	if uioDriver {
+		logrus.Debugf("Disk %s path %s uses uio_pci_generic; trying multiple driver types for cleanup", diskName, d.DiskPath)
+		for _, drv := range []commontypes.DiskDriver{
+			commontypes.DiskDriverNvme,
+			commontypes.DiskDriverVirtioBlk,
+			commontypes.DiskDriverVirtioScsi,
+		} {
+			if _, delErr := d.DiskDelete(spdkClient, diskName, d.UUID, d.DiskPath, string(drv)); delErr == nil {
+				logrus.Infof("Disk %s cleaned up successfully using driver %s", diskName, drv)
+				break
+			}
+		}
+		return nil // no matter success or not, retry
+	}
+
+	exactDriver, detectErr := spdkdisk.GetDiskDriver(commontypes.DiskDriver(diskDriver), d.DiskPath)
+	if detectErr != nil {
+		return errors.Wrap(detectErr, "failed to detect exact driver for unhealthy disk")
+	}
+
+	if _, delErr := d.DiskDelete(spdkClient, diskName, d.UUID, d.DiskPath, string(exactDriver)); delErr != nil {
+		logrus.WithError(delErr).Warnf("Failed to delete disk %s path %s with detected driver %s", diskName, d.DiskPath, exactDriver)
+		return delErr
+	}
+
+	return nil
 }
