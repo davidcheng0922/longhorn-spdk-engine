@@ -11,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/longhorn/backupstore"
+	"github.com/longhorn/go-spdk-helper/pkg/initiator"
 
 	"github.com/longhorn/go-spdk-helper/pkg/initiator"
 
