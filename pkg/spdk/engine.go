@@ -1,6 +1,7 @@
 package spdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -19,6 +20,8 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	"github.com/longhorn/backupstore"
+	btypes "github.com/longhorn/backupstore/types"
+	butil "github.com/longhorn/backupstore/util"
 	"github.com/longhorn/go-spdk-helper/pkg/initiator"
 	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
@@ -42,6 +45,8 @@ import (
 type Engine struct {
 	sync.RWMutex
 
+	ctx context.Context
+
 	Name       string
 	VolumeName string
 	SpecSize   uint64
@@ -64,8 +69,8 @@ type Engine struct {
 	Head        *api.Lvol
 	SnapshotMap map[string]*api.Lvol
 
-	IsRestoring           bool
-	RestoringSnapshotName string
+	IsRestoring bool
+	restore     *EngineRestore
 
 	isExpanding           bool
 	lastExpansionFailedAt string
@@ -103,7 +108,7 @@ type UblkFrontend struct {
 	UblkID int32
 }
 
-func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}, ublkQueueDepth, ublkNumberOfQueue int32) *Engine {
+func NewEngine(ctx context.Context, engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}, ublkQueueDepth, ublkNumberOfQueue int32) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
 		"volumeName": volumeName,
@@ -128,6 +133,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	}
 
 	return &Engine{
+		ctx: ctx,
+
 		Name:       engineName,
 		VolumeName: volumeName,
 		Frontend:   frontend,
@@ -145,6 +152,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 		State: types.InstanceStatePending,
 
 		SnapshotMap: map[string]*api.Lvol{},
+
+		restore: &EngineRestore{},
 
 		UpdateCh: engineUpdateCh,
 
@@ -393,6 +402,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	}
 
 	e.State = types.InstanceStateRunning
+	e.restore.TargetAddress = targetAddress
 
 	e.log.Info("Created engine")
 
@@ -792,6 +802,11 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	}()
 
 	e.log.Info("Deleting engine")
+	if e.IsRestoring && e.restore != nil {
+		e.log.Info("Canceling volume restoration before engine deletion")
+		e.restore.Stop()
+		return fmt.Errorf("waiting for volume restoration to stop")
+	}
 
 	if e.NvmeTcpFrontend != nil && e.NvmeTcpFrontend.Nqn == "" {
 		e.NvmeTcpFrontend.Nqn = helpertypes.GetNQN(e.Name)
@@ -2850,13 +2865,13 @@ func (e *Engine) BackupStatus(backupName, replicaAddress string) (*spdkrpc.Backu
 	return replicaServiceCli.ReplicaBackupStatus(backupName)
 }
 
-func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, engineName, snapshotName string, credential map[string]string, concurrentLimit int32) (*spdkrpc.EngineBackupRestoreResponse, error) {
+func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, engineName, snapshotName string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) (resp *spdkrpc.EngineBackupRestoreResponse, err error) {
 	e.log.Infof("Restoring backup %s", backupUrl)
 
 	e.Lock()
 	defer e.Unlock()
 
-	resp := &spdkrpc.EngineBackupRestoreResponse{
+	resp = &spdkrpc.EngineBackupRestoreResponse{
 		Errors: map[string]string{},
 	}
 
@@ -2872,179 +2887,301 @@ func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, engineN
 		return nil, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
 	}
 
-	e.log.Infof("Deleting raid bdev %s before restoration", e.Name)
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return nil, errors.Wrapf(err, "failed to delete raid bdev %s before restoration", e.Name)
+	if err := e.backupRestorePrepare(spdkClient, backupUrl, snapshotName, credential, concurrentLimit, superiorPortAllocator); err != nil {
+		return nil, err
 	}
 
-	e.log.Info("Disconnecting all replicas before restoration")
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName); err != nil {
-			e.log.Infof("Failed to remove replica %s before restoration", replicaName)
-			return nil, errors.Wrapf(err, "failed to remove replica %s before restoration", replicaName)
-		}
-		replicaStatus.BdevName = ""
-	}
-
+	isFullRestore := e.restore.DeepCopy().LastRestored == ""
 	e.IsRestoring = true
 
-	switch {
-	case snapshotName != "":
-		e.RestoringSnapshotName = snapshotName
-		e.log.Infof("Using input snapshot name %s for the restore", e.RestoringSnapshotName)
-	case len(e.SnapshotMap) == 0:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the full restore", e.RestoringSnapshotName)
-	case e.RestoringSnapshotName != "":
-		e.log.Infof("Using existing snapshot name %s for the incremental restore", e.RestoringSnapshotName)
-	default:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the incremental restore because e.FinalSnapshotName is empty", e.RestoringSnapshotName)
-	}
-
+	// Note: finishRestore() is called either:
+	// (1) here if restore initiation fails (err != nil), OR
+	// (2) inside completeBackupRestore() if restore successfully starts.
+	// They are mutually exclusive and will never both execute.
 	defer func() {
-		go func() {
-			if err := e.completeBackupRestore(spdkClient); err != nil {
-				e.log.WithError(err).Warn("Failed to complete backup restore")
+		if err != nil {
+			if extraErr := e.finishRestore(spdkClient, err, superiorPortAllocator); extraErr != nil {
+				e.log.WithError(extraErr).Error("Failed to finish engine backup restore")
 			}
-		}()
+		}
 	}()
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		e.log.Infof("Restoring backup on replica %s address %s", replicaName, replicaStatus.Address)
-
-		replicaServiceCli, err := GetServiceClient(replicaStatus.Address)
-		if err != nil {
-			e.log.WithError(err).Errorf("Failed to restore backup on replica %s with address %s", replicaName, replicaStatus.Address)
-			resp.Errors[replicaStatus.Address] = err.Error()
-			continue
-		}
-
-		func() {
-			defer func() {
-				if errClose := replicaServiceCli.Close(); errClose != nil {
-					e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during restore backup", replicaName, replicaStatus.Address)
-				}
-			}()
-
-			err = replicaServiceCli.ReplicaBackupRestore(&client.BackupRestoreRequest{
-				BackupUrl:       backupUrl,
-				ReplicaName:     replicaName,
-				SnapshotName:    e.RestoringSnapshotName,
-				Credential:      credential,
-				ConcurrentLimit: concurrentLimit,
-			})
-			if err != nil {
-				e.log.WithError(err).Errorf("Failed to restore backup on replica %s address %s", replicaName, replicaStatus.Address)
-				resp.Errors[replicaStatus.Address] = err.Error()
-			}
-		}()
+	// setup NVMe-TCP frontend
+	e.log.Infof("Setting up NVMe-TCP frontend for backup restore to address %v", e.restore.TargetAddress)
+	if err := e.handleNvmeTcpFrontend(spdkClient, superiorPortAllocator, 1, e.restore.TargetAddress, true, true); err != nil {
+		return resp, errors.Wrapf(err, "failed to setup NVMe-TCP frontend for backup restore to address %v", e.restore.TargetAddress)
 	}
+
+	// execute backup restore
+	if isFullRestore {
+		e.log.Infof("Starting a new full restore for backup %v", backupUrl)
+		if err := e.backupRestore(backupUrl, concurrentLimit); err != nil {
+			return resp, errors.Wrapf(err, "failed to start full backup restore")
+		}
+		e.log.Infof("Successfully initiated full restore for %v to %v", backupUrl, e.Name)
+	} else {
+		e.log.Infof("Starting an incremental restore for backup %v", backupUrl)
+		newRestore := e.restore.DeepCopy()
+		if err := e.backupRestoreIncrementally(backupUrl, newRestore.LastRestored, concurrentLimit); err != nil {
+			return resp, errors.Wrapf(err, "failed to start incremental backup restore")
+		}
+		e.log.Infof("Successfully initiated incremental restore for %v to %v", backupUrl, e.Name)
+	}
+
+	// Only wait backup restore if backup restore initiation is successful
+	go func() {
+		if err := e.completeBackupRestore(spdkClient, isFullRestore, superiorPortAllocator); err != nil {
+			e.log.WithError(err).Warn("Failed to complete backup restore")
+		}
+	}()
 
 	return resp, nil
 }
 
-func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client) error {
-	if err := e.waitForRestoreComplete(); err != nil {
-		return errors.Wrapf(err, "failed to wait for restore complete")
+func (e *Engine) backupRestorePrepare(spdkClient *spdkclient.Client, backupUrl, snapshotName string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) error {
+	if e.IsRestoring {
+		return fmt.Errorf("cannot initiate backup restore as there is one already in progress")
 	}
 
-	return e.BackupRestoreFinish(spdkClient)
-}
-
-func (e *Engine) waitForRestoreComplete() error {
-	periodicChecker := time.NewTicker(time.Duration(restorePeriodicRefreshInterval.Seconds()) * time.Second)
-	defer periodicChecker.Stop()
-
-	var err error
-	for range periodicChecker.C {
-		isReplicaRestoreCompleted := true
-		for replicaName, replicaStatus := range e.ReplicaStatusMap {
-			if replicaStatus.Mode != types.ModeRW {
-				continue
-			}
-
-			isReplicaRestoreCompleted, err = e.isReplicaRestoreCompleted(replicaName, replicaStatus.Address)
-			if err != nil {
-				return errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
-			}
-
-			if !isReplicaRestoreCompleted {
-				break
-			}
+	restoreSnapshotName := ""
+	switch {
+	case snapshotName != "":
+		restoreSnapshotName = snapshotName
+		e.log.Infof("Using input snapshot name %s for the restore", restoreSnapshotName)
+	case len(e.SnapshotMap) == 0:
+		restoreSnapshotName = util.UUID()
+		e.log.Infof("Using new generated snapshot name %s for the full restore", restoreSnapshotName)
+	case e.restore != nil && e.restore.LastRestored != "":
+		if e.restore.SnapshotName == "" {
+			restoreSnapshotName = util.UUID()
+			e.log.Infof("Previous restore was incremental but snapshotName missing; generating new snapshot name %s", restoreSnapshotName)
+		} else {
+			restoreSnapshotName = e.restore.SnapshotName
+			e.log.Infof("Using existing snapshot name %s for incremental restore", restoreSnapshotName)
 		}
-
-		if isReplicaRestoreCompleted {
-			e.log.Info("Backup restoration completed successfully")
-			return nil
-		}
+	default:
+		restoreSnapshotName = util.UUID()
+		e.log.Infof("Using new generated snapshot name %s for the incremental restore because e.FinalSnapshotName is empty", restoreSnapshotName)
 	}
 
-	return errors.Errorf("failed to wait for engine %s restore complete", e.Name)
-}
-
-func (e *Engine) isReplicaRestoreCompleted(replicaName, replicaAddress string) (bool, error) {
-	log := e.log.WithFields(logrus.Fields{
-		"replica": replicaName,
-		"address": replicaAddress,
-	})
-	log.Trace("Checking replica restore status")
-
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
+	// credential setup
+	backupType, err := butil.CheckBackupType(backupUrl)
 	if err != nil {
-		return false, errors.Wrapf(err, "failed to get replica %v service client %s", replicaName, replicaAddress)
+		err = errors.Wrapf(err, "failed to check the type for restoring backup %v", backupUrl)
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%v", err)
 	}
+
+	err = butil.SetupCredential(backupType, credential)
+	if err != nil {
+		err = errors.Wrapf(err, "failed to setup credential for restoring backup %v", backupUrl)
+		return grpcstatus.Errorf(grpccodes.Internal, "%v", err)
+	}
+
+	backupName, _, _, err := backupstore.DecodeBackupURL(util.UnescapeURL(backupUrl))
+	if err != nil {
+		err = errors.Wrapf(err, "failed to decode backup url %v", backupUrl)
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%v", err)
+	}
+
+	if e.restore == nil {
+		return grpcstatus.Errorf(grpccodes.NotFound, "restoration for backup %v is not initialized", backupUrl)
+	}
+
+	restore := e.restore.DeepCopy()
+	if restore.State == btypes.ProgressStateError {
+		return fmt.Errorf("cannot start restoring backup %v of the previous failed restoration", backupUrl)
+	}
+
+	if restore.LastRestored == backupName {
+		return grpcstatus.Errorf(grpccodes.AlreadyExists, "already restored backup %v", backupName)
+	}
+
+	// Initialize `r.restore`
+	// First restore request. It must be a normal full restore.
+	if restore.LastRestored == "" && (restore.State == btypes.ProgressStateUndefined || restore.State == btypes.ProgressStateCanceled) {
+		e.log.Infof("Starting a new restore for backup %v with restore state %v", backupUrl, restore.State)
+
+		e.restore = NewEngineRestore(spdkClient, restoreSnapshotName, backupUrl, backupName, e)
+	} else {
+		e.log.Infof("Resetting the restore for backup %v", backupUrl)
+
+		validLastRestoredBackup := e.canDoIncrementalRestore(restore, backupUrl, backupName)
+		if validLastRestoredBackup {
+			e.log.Infof("Starting an incremental restore for backup %v", backupUrl)
+		} else {
+			e.log.Infof("Starting a full restore for backup %v", backupUrl)
+		}
+
+		e.restore.StartNewRestore(backupUrl, backupName, restoreSnapshotName, validLastRestoredBackup)
+	}
+
+	return nil
+}
+
+func (e *Engine) canDoIncrementalRestore(restore *EngineRestore, backupURL, requestedBackupName string) bool {
+	if restore.LastRestored == "" {
+		e.log.Warnf("There is a restore record in the server but last restored backup is empty with restore state is %v, will do full restore instead", restore.State)
+		return false
+	}
+	if _, err := backupstore.InspectBackup(strings.Replace(backupURL, requestedBackupName, restore.LastRestored, 1)); err != nil {
+		e.log.WithError(err).Warnf("The last restored backup %v becomes invalid for incremental restore, will do full restore instead", restore.LastRestored)
+		return false
+	}
+	return true
+}
+
+func (e *Engine) backupRestoreIncrementally(backupURL, lastRestored string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"lastRestored":    lastRestored,
+		"endpoint":        e.initiator.Endpoint,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Start restoring backup incrementally")
+
+	return backupstore.RestoreDeltaBlockBackupIncrementally(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		LastBackupName:  lastRestored,
+		Filename:        e.initiator.Endpoint,
+		ConcurrentLimit: int32(concurrentLimit),
+	})
+}
+
+func (e *Engine) backupRestore(backupURL string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"endpoint":        e.initiator.Endpoint,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Start restoring backup")
+
+	return backupstore.RestoreDeltaBlockBackup(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		Filename:        e.initiator.Endpoint,
+		ConcurrentLimit: int32(concurrentLimit),
+	})
+}
+
+func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, isFullRestore bool, superiorPortAllocator *commonbitmap.Bitmap) (err error) {
 	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during check restore status", replicaName, replicaAddress)
+		if extraErr := e.finishRestore(spdkClient, err, superiorPortAllocator); extraErr != nil {
+			e.log.WithError(extraErr).Error("Failed to finish engine backup restore")
 		}
 	}()
 
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return false, errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
+	if err := e.waitForRestoreComplete(); err != nil {
+		return errors.Wrapf(err, "failed to wait for engine restore complete")
 	}
 
-	return !status.IsRestoring, nil
+	if e.restore.State == btypes.ProgressStateCanceled {
+		e.log.Info("Doing nothing for canceled backup restoration")
+		return nil
+	}
+
+	// full restore: delete only if snapshot exists
+	if isFullRestore {
+		if _, exists := e.SnapshotMap[e.restore.SnapshotName]; exists {
+			e.log.Infof("Deleting existing snapshot %v of the restored volume", e.restore.SnapshotName)
+			err := e.SnapshotDelete(spdkClient, e.restore.SnapshotName)
+			if err != nil {
+				e.log.WithError(err).Errorf("Failed to delete existing snapshot %v of the restored volume", e.restore.SnapshotName)
+				return errors.Wrapf(err, "failed to delete snapshot %v of the restored volume", e.restore.SnapshotName)
+			}
+		}
+	} else {
+		// incremental restore: always delete snapshot
+		e.log.Infof("Deleting snapshot %v for incremental restore", e.restore.SnapshotName)
+		if err := e.SnapshotDelete(spdkClient, e.restore.SnapshotName); err != nil {
+			return errors.Wrapf(err, "failed to delete snapshot %v for incremental restore", e.restore.SnapshotName)
+		}
+	}
+
+	if _, err := e.SnapshotCreate(spdkClient, e.restore.SnapshotName); err != nil {
+		return errors.Wrapf(err, "failed to create snapshot %v after restore", e.restore.SnapshotName)
+	}
+	e.log.Infof("Successfully replaced snapshot %v after restore", e.restore.SnapshotName)
+
+	return nil
 }
 
-func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
-	e.Lock()
-	defer e.Unlock()
+func (e *Engine) waitForRestoreComplete() error {
+	e.log.Info("Waiting for restore to complete")
 
-	replicaBdevList := []string{}
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		replicaAddress := replicaStatus.Address
-		replicaIP, replicaPort, err := net.SplitHostPort(replicaAddress)
-		if err != nil {
-			return err
+	periodicChecker := time.NewTicker(time.Duration(restorePeriodicRefreshInterval.Seconds()) * time.Second)
+	defer periodicChecker.Stop()
+
+	for range periodicChecker.C {
+		e.restore.RLock()
+		restoreProgress := e.restore.Progress
+		restoreError := e.restore.Error
+		restoreState := e.restore.State
+		e.restore.RUnlock()
+
+		e.log.Tracef("Restore progress: %d%%, state: %s, error: %s", restoreProgress, restoreState, restoreError)
+
+		if restoreProgress == 100 {
+			e.log.Info("Backup restoration completed successfully")
+			return nil
 		}
-		e.log.Infof("Attaching replica %s with address %s before finishing restoration", replicaName, replicaAddress)
-		nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort,
-			spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
-			int32(e.ctrlrLossTimeout), replicaReconnectDelaySec, int32(e.fastIOFailTimeoutSec), replicaMultipath)
-		if err != nil {
-			return err
+		if restoreState == btypes.ProgressStateCanceled {
+			e.log.Info("Backup restoration is cancelled")
+			return nil
 		}
-
-		if len(nvmeBdevNameList) != 1 {
-			return fmt.Errorf("got unexpected nvme bdev list %v", nvmeBdevNameList)
-		}
-
-		replicaStatus.BdevName = nvmeBdevNameList[0]
-
-		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName)
-	}
-
-	e.log.Infof("Creating raid bdev %s with replicas %+v before finishing restoration", e.Name, replicaBdevList)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
-		if !jsonrpc.IsJSONRPCRespErrorFileExists(err) {
-			e.log.WithError(err).Errorf("Failed to create raid bdev before finishing restoration")
+		if restoreError != "" {
+			err := fmt.Errorf("%v", restoreError)
+			e.log.WithError(err).Errorf("Found backup restoration error")
 			return err
 		}
 	}
+	return nil
+}
 
-	e.IsRestoring = false
+func (e *Engine) finishRestore(spdkClient *spdkclient.Client, restoreErr error, superiorPortAllocator *commonbitmap.Bitmap) error {
+	defer func() {
+		e.log.Infof("Unflagging IsRestoring")
+		e.IsRestoring = false
+
+		// Clear endpoint and port because it is empty frontend
+		e.Endpoint = ""
+		e.NvmeTcpFrontend.Port = 0
+
+		if e.restore == nil {
+			return
+		}
+		if restoreErr != nil {
+			// Use TargetBdev or any identifier as "snapshot" parameter (only for logging/status)
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, restoreErr)
+			return
+		}
+		e.restore.FinishRestore()
+	}()
+
+	if !e.IsRestoring {
+		err := fmt.Errorf("BUG: engine is not being restored")
+		if restoreErr != nil {
+			restoreErr = util.CombineErrors(err, restoreErr)
+		} else {
+			restoreErr = err
+		}
+		return err
+	}
+
+	e.log.Infof("Disconnecting NVMe-TCP target %s after restore", e.restore.TargetAddress)
+	if err := e.disconnectTarget(e.restore.TargetAddress); err != nil {
+		e.log.WithError(err).Warn("Failed to disconnect NVMe-TCP target after restore")
+	}
+
+	if err := spdkClient.StopExposeBdev(e.NvmeTcpFrontend.Nqn); err != nil {
+		e.log.WithError(err).Warnf("Failed to stop exposing bdev for NVMe-TCP frontend nqn %s after restore", e.NvmeTcpFrontend.Nqn)
+	}
+
+	if err := e.releasePorts(superiorPortAllocator); err != nil {
+		e.log.WithError(err).Warn("Failed to release ports after restore")
+	}
 
 	return nil
 }
@@ -3057,38 +3194,31 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 	e.Lock()
 	defer e.Unlock()
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
-			continue
+	// No restore initiated
+	if e.restore == nil {
+		resp.Status[e.Name] = &spdkrpc.ReplicaRestoreStatusResponse{
+			ReplicaName:    e.Name,
+			ReplicaAddress: fmt.Sprintf("%s:%d", e.NvmeTcpFrontend.TargetIP, 0), // fallback
+			IsRestoring:    false,
 		}
-
-		restoreStatus, err := e.getReplicaRestoreStatus(replicaName, replicaStatus.Address)
-		if err != nil {
-			return nil, err
-		}
-		resp.Status[replicaStatus.Address] = restoreStatus
+		return resp, nil
 	}
 
+	e.restore.RLock()
+	defer e.restore.RUnlock()
+
+	status := &spdkrpc.ReplicaRestoreStatusResponse{
+		IsRestoring:            e.IsRestoring,
+		LastRestored:           e.restore.LastRestored,
+		Progress:               int32(e.restore.Progress),
+		Error:                  e.restore.Error,
+		State:                  string(e.restore.State),
+		BackupUrl:              e.restore.BackupURL,
+		CurrentRestoringBackup: e.restore.CurrentRestoringBackup,
+	}
+
+	resp.Status[e.Name] = status
 	return resp, nil
-}
-
-func (e *Engine) getReplicaRestoreStatus(replicaName, replicaAddress string) (*spdkrpc.ReplicaRestoreStatusResponse, error) {
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			e.log.WithError(errClose).Errorf("Failed to close replica client with address %s during get restore status", replicaAddress)
-		}
-	}()
-
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return nil, err
-	}
-
-	return status, nil
 }
 
 // Suspend suspends the engine. IO operations will be suspended.
