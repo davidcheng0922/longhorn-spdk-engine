@@ -49,8 +49,9 @@ const (
 type Disk struct {
 	sync.RWMutex
 
-	Name string
-	UUID string
+	Name         string // lvstore name
+	UUID         string
+	BdevDiskName string // disk driver name
 
 	DiskDriver string
 	DiskID     string
@@ -110,7 +111,19 @@ func (d *Disk) DiskCreate(spdkClient *spdkclient.Client, diskName, diskUUID, dis
 	}
 	d.DiskDriver = string(exactDiskDriver)
 
-	lvstoreUUID, err := addBlockDevice(spdkClient, diskName, diskUUID, diskPath, exactDiskDriver, blockSize)
+	// SPDK may leave a ghost bdev name after certain delete failures, causing name
+	// collisions on subsequent creations. Use a unique bdev name to avoid this.
+	//
+	// More details: https://github.com/longhorn/longhorn/issues/12640
+	var bdevDiskName string
+	if d.BdevDiskName == "" {
+		bdevDiskName = buildDiskBdevName(diskName, diskUUID)
+		d.BdevDiskName = bdevDiskName
+	} else {
+		bdevDiskName = d.BdevDiskName
+	}
+
+	lvstoreUUID, err := addBlockDevice(spdkClient, bdevDiskName, diskUUID, diskPath, exactDiskDriver, blockSize)
 	if err != nil {
 		log.WithError(err).Error("Failed to add block device")
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to add disk block device: %v", err)
@@ -178,7 +191,13 @@ func (d *Disk) DiskDelete(spdkClient *spdkclient.Client, diskName, diskUUID, dis
 	if diskDriver == "" {
 		diskDriver = d.DiskDriver
 	}
-	if _, err := spdkdisk.DiskDelete(spdkClient, diskName, diskPath, diskDriver); err != nil {
+	if _, err := spdkdisk.DiskDelete(spdkClient, d.BdevDiskName, diskPath, diskDriver); err != nil {
+		// check if device still exist, if not, treat it as deleted
+		_, getErr := spdkdisk.DiskGet(spdkClient, d.BdevDiskName, diskPath, diskDriver, 0)
+		if getErr != nil && jsonrpc.IsJSONRPCRespErrorNoSuchDevice(getErr) {
+			return &emptypb.Empty{}, nil
+		}
+
 		return nil, errors.Wrapf(err, "failed to delete disk %v", diskName)
 	}
 
@@ -190,7 +209,7 @@ type DeviceInfo struct {
 }
 
 func (d *Disk) updateDiskFromLvstoreNoLock(spdkClient *spdkclient.Client, diskName, diskPath, diskDriver string) (string, error) {
-	bdevs, err := spdkdisk.DiskGet(spdkClient, diskName, diskPath, diskDriver, 0)
+	bdevs, err := spdkdisk.DiskGet(spdkClient, d.BdevDiskName, diskPath, diskDriver, 0)
 	if err != nil {
 		if !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 			return "", grpcstatus.Errorf(grpccodes.Internal, "failed to get bdev with name %q: %v", diskName, err)
@@ -288,12 +307,12 @@ func (d *Disk) DiskGet(spdkClient *spdkclient.Client, diskName, diskPath, diskDr
 	d.RUnlock()
 
 	d.Lock()
-	diskBdevName, err := d.updateDiskFromLvstoreNoLock(spdkClient, diskName, diskPath, diskDriver)
+	lvstoreName, err := d.updateDiskFromLvstoreNoLock(spdkClient, diskName, diskPath, diskDriver)
 	if err != nil {
 		d.Unlock()
 		return nil, err
 	}
-	if err := d.lvstoreToDisk(spdkClient, diskBdevName, ""); err != nil {
+	if err := d.lvstoreToDisk(spdkClient, lvstoreName, ""); err != nil {
 		d.Unlock()
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to update disk from lvstore: %v", err)
 	}
@@ -361,13 +380,13 @@ func validateAioDiskCreation(spdkClient *spdkclient.Client, diskPath string, dis
 	return nil
 }
 
-func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalDiskPath string, diskDriver commontypes.DiskDriver, blockSize int64) (string, error) {
+func addBlockDevice(spdkClient *spdkclient.Client, bdevDiskName, diskUUID, originalDiskPath string, diskDriver commontypes.DiskDriver, blockSize int64) (string, error) {
 	log := logrus.WithFields(logrus.Fields{
-		"diskName":   diskName,
-		"diskUUID":   diskUUID,
-		"diskPath":   originalDiskPath,
-		"diskDriver": diskDriver,
-		"blockSize":  blockSize,
+		"bdevDiskName": bdevDiskName,
+		"diskUUID":     diskUUID,
+		"diskPath":     originalDiskPath,
+		"diskDriver":   diskDriver,
+		"blockSize":    blockSize,
 	})
 
 	diskPath := originalDiskPath
@@ -380,11 +399,13 @@ func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalD
 
 	log.Info("Creating disk bdev")
 
-	bdevName, err := spdkdisk.DiskCreate(spdkClient, diskName, diskPath, string(diskDriver), uint64(blockSize))
+	bdevName, err := spdkdisk.DiskCreate(spdkClient, bdevDiskName, diskPath, string(diskDriver), uint64(blockSize))
 	if err != nil {
 		if !jsonrpc.IsJSONRPCRespErrorFileExists(err) {
 			return "", errors.Wrapf(err, "failed to create disk bdev")
 		}
+
+		bdevName = bdevDiskName
 	}
 
 	bdevs, err := spdkdisk.DiskGet(spdkClient, bdevName, diskPath, "", 0)
@@ -490,7 +511,7 @@ func (d *Disk) diskHealthGet(spdkClient *spdkclient.Client, diskName, diskDriver
 	d.Lock()
 	defer d.Unlock()
 
-	healthInfo, err := spdkClient.BdevNvmeGetControllerHealthInfo(diskName)
+	healthInfo, err := spdkClient.BdevNvmeGetControllerHealthInfo(d.BdevDiskName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get NVMe bdev controller health info for disk %q", diskName)
 	}
@@ -510,4 +531,12 @@ func isNvmeDriver(diskDriver, diskPath string) bool {
 	}
 
 	return exactDiskDriver == commontypes.DiskDriverNvme
+}
+
+func buildDiskBdevName(diskName string, diskUUID string) string {
+	if diskUUID != "" {
+		return fmt.Sprintf("%s-%s", diskName, diskUUID[:8])
+	}
+
+	return fmt.Sprintf("%s-%s", diskName, util.UUID()[:8])
 }
