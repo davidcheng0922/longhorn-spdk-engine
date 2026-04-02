@@ -503,22 +503,62 @@ func (s *Server) EngineBackupStatus(ctx context.Context, req *spdkrpc.BackupStat
 
 func (s *Server) EngineBackupRestore(ctx context.Context, req *spdkrpc.EngineBackupRestoreRequest) (ret *spdkrpc.EngineBackupRestoreResponse, err error) {
 	logrus.WithFields(logrus.Fields{
-		"backup":       req.BackupUrl,
-		"engine":       req.EngineName,
-		"snapshotName": req.SnapshotName,
-		"concurrent":   req.ConcurrentLimit,
+		"backup":     req.BackupUrl,
+		"engine":     req.EngineName,
+		"concurrent": req.ConcurrentLimit,
 	}).Info("Restoring backup")
 
 	s.RLock()
 	e := s.engineMap[req.EngineName]
 	spdkClient := s.spdkClient
+	portAllocator := s.portAllocator
+
+	// Find the EngineFrontend associated with this engine.
+	var ef *EngineFrontend
+	for _, frontend := range s.engineFrontendMap {
+		if frontend.EngineName == req.EngineName {
+			ef = frontend
+			break
+		}
+	}
 	s.RUnlock()
 
 	if e == nil {
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v for restoring backup", req.EngineName)
 	}
 
-	return e.BackupRestore(spdkClient, req.BackupUrl, req.EngineName, req.SnapshotName, req.Credential, req.ConcurrentLimit)
+	// Route through EngineFrontend when available so it can manage the NVMe-TCP initiator.
+	if ef != nil {
+		return ef.BackupRestore(e, spdkClient, req.BackupUrl, req.Credential, req.ConcurrentLimit, portAllocator)
+	}
+
+	// No persistent EngineFrontend found (e.g. DR restore engines that Longhorn manager
+	// creates without an associated frontend). Create a temporary EngineFrontend solely
+	// for the duration of this restore. It is NOT registered in engineFrontendMap.
+	//
+	// FrontendSPDKTCPBlockdev causes handleFrontend to create an NVMe-TCP initiator
+	// and expose a block device that EngineRestore.OpenVolumeDev can open.
+	//
+	// The channel needs capacity 2: BackupRestore sends once at return (success path)
+	// and the background goroutine sends once at completion. No reader is required;
+	// the buffer prevents blocking and the channel is GC'd with the temp frontend.
+	e.RLock()
+	volumeName := e.VolumeName
+	specSize := e.SpecSize
+	e.RUnlock()
+
+	throwawayUpdateCh := make(chan interface{}, 2)
+	tempEF := NewEngineFrontend(
+		e.Name+"-restore",
+		e.Name,
+		volumeName,
+		types.FrontendSPDKTCPBlockdev,
+		specSize,
+		types.DefaultUblkQueueDepth,
+		types.DefaultUblkNumberOfQueue,
+		throwawayUpdateCh,
+	)
+	return tempEF.BackupRestore(e, spdkClient, req.BackupUrl, req.Credential, req.ConcurrentLimit, portAllocator)
 }
 
 func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreStatusRequest) (*spdkrpc.RestoreStatusResponse, error) {

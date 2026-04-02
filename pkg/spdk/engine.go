@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	retry "github.com/avast/retry-go/v4"
+	retrygo "github.com/avast/retry-go/v4"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -97,7 +97,8 @@ func (m *MockReplicaAdder) ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServ
 type Engine struct {
 	sync.RWMutex
 
-	ctx context.Context
+	ctx       context.Context
+	cancelCtx context.CancelFunc
 
 	Name       string
 	VolumeName string
@@ -160,8 +161,11 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	}
 	log.WithField("specSize", roundedSpecSize)
 
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
 	e := &Engine{
-		ctx: ctx,
+		ctx:       ctx,
+		cancelCtx: cancelCtx,
 
 		Name:       engineName,
 		VolumeName: volumeName,
@@ -293,11 +297,34 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	}
 
 	e.State = types.InstanceStateRunning
-	e.restore.TargetAddress = targetAddress
 
 	e.log.Info("Created engine target")
 
 	return e.getWithoutLock(), nil
+}
+
+// ensureNvmeTcpTargetForRestore creates a temporary NVMe-TCP target if the engine does not
+// already have one (e.g. engines with Frontend = ""). Called by EngineFrontend before
+// connecting its restore initiator so that the target address is available.
+func (e *Engine) ensureNvmeTcpTargetForRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap) error {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget.IP != "" && e.NvmeTcpTarget.Port != 0 {
+		return nil // target already present (e.g. from a prior partial restore attempt)
+	}
+
+	e.log.Info("Creating temporary NVMe-TCP target for backup restore")
+	if err := e.createNVMeTCPTarget(spdkClient, superiorPortAllocator, 1); err != nil {
+		if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+			e.log.WithError(relErr).Warn("Failed to release ports after temporary NVMe-TCP target creation failure")
+		}
+		e.NvmeTcpTarget.IP = ""
+		e.NvmeTcpTarget.Nguid = ""
+		e.NvmeTcpTarget.Nqn = ""
+		return errors.Wrap(err, "failed to create temporary NVMe-TCP target for backup restore")
+	}
+	return nil
 }
 
 func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, portCount int32) error {
@@ -481,6 +508,7 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	e.log.Info("Deleting engine")
 	if e.IsRestoring && e.restore != nil {
 		e.log.Info("Canceling volume restoration before engine deletion")
+		e.cancelCtx()
 		e.restore.Stop()
 		return fmt.Errorf("waiting for volume restoration to stop")
 	}
@@ -1862,38 +1890,57 @@ func (e *Engine) BackupStatus(backupName, replicaAddress string) (*spdkrpc.Backu
 	return replicaServiceCli.ReplicaBackupStatus(backupName)
 }
 
-func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) (resp *spdkrpc.EngineBackupRestoreResponse, err error) {
+// BackupRestore initiates a backup restore for the engine.
+// It returns a done channel that is closed when the restore goroutine completes
+// (whether successfully, with an error, or cancelled). Callers that set up a
+// temporary frontend connection should wait on this channel before tearing it down.
+func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, endpoint string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) (resp *spdkrpc.EngineBackupRestoreResponse, doneCh <-chan struct{}, err error) {
 	e.log.Infof("Restoring backup %s", backupUrl)
 
 	e.Lock()
 	defer e.Unlock()
+
+	defer func() {
+		if err != nil && e.Frontend == types.FrontendEmpty && e.NvmeTcpTarget != nil && e.NvmeTcpTarget.Nqn != "" {
+			e.log.Infof("Cleaning up temporary NVMe-TCP target %s after synchronous backup restore failure", e.NvmeTcpTarget.Nqn)
+			if stopErr := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); stopErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(stopErr) {
+				e.log.WithError(stopErr).Warn("Failed to stop exposing bdev after synchronous backup restore failure")
+			}
+			e.NvmeTcpTarget.Nqn = ""
+			e.NvmeTcpTarget.Nguid = ""
+			e.NvmeTcpTarget.IP = ""
+			if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+				e.log.WithError(relErr).Warn("Failed to release ports after synchronous backup restore failure")
+			}
+		}
+	}()
 
 	resp = &spdkrpc.EngineBackupRestoreResponse{
 		Errors: map[string]string{},
 	}
 
 	if len(e.ReplicaStatusMap) == 0 {
-		return resp, fmt.Errorf("cannot restore backup %s: no replicas available", backupUrl)
+		return resp, nil, fmt.Errorf("cannot restore backup %s: no replicas available", backupUrl)
 	}
 
 	for _, replicaStatus := range e.ReplicaStatusMap {
 		if replicaStatus.Mode != types.ModeRW {
-			return resp, fmt.Errorf("cannot restore backup %s: replica %s is in mode %v", backupUrl, replicaStatus.Address, replicaStatus.Mode)
+			return resp, nil, fmt.Errorf("cannot restore backup %s: replica %s is in mode %v", backupUrl, replicaStatus.Address, replicaStatus.Mode)
 		}
 	}
 
 	backupInfo, err := backupstore.InspectBackup(backupUrl)
 	if err != nil {
-		return resp, err
+		return resp, nil, err
 	}
 
 	if backupInfo.VolumeSize != int64(e.SpecSize) {
-		return resp, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
+		return resp, nil, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
 	}
 
 	isFullRestore, err := e.backupRestorePrepare(spdkClient, backupUrl, credential, superiorPortAllocator)
 	if err != nil {
-		return resp, err
+		return resp, nil, err
 	}
 
 	lastRestored := e.restore.LastRestored
@@ -1901,39 +1948,46 @@ func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl string, 
 	defer func() {
 		if err != nil {
 			e.IsRestoring = false
+			e.Endpoint = ""
 		}
 	}()
 
-	// TODO: Move frontend handling out of EngineRestore.
-	// In the future, the engine frontend and engine resource will be separated.
-	e.log.Infof("Setting up NVMe-TCP frontend for backup restore to address %v", e.restore.TargetAddress)
-	if err := e.handleNvmeTcpFrontend(spdkClient, superiorPortAllocator, 1, e.restore.TargetAddress, true, true); err != nil {
-		return resp, errors.Wrapf(err, "failed to setup NVMe-TCP frontend for backup restore to address %v", e.restore.TargetAddress)
-	}
+	// The frontend (NVMe-TCP initiator) is managed by EngineFrontend.
+	// Store the provided endpoint so EngineRestore.OpenVolumeDev can access the block device.
+	// Also copy it into e.restore.endpoint so OpenVolumeDev does not need to re-acquire the
+	// engine lock (which would deadlock — BackupRestore already holds e.Lock()).
+	e.log.Infof("Using endpoint %v for backup restore", endpoint)
+	e.Endpoint = endpoint
+	e.restore.endpoint = endpoint
 
-	// Only wait backup restore if backup restore initiation is successful
-	go func() {
-		if err := e.completeBackupRestore(spdkClient, superiorPortAllocator, backupInfo.SnapshotName); err != nil {
-			e.log.WithError(err).Warn("Failed to complete backup restore")
-		}
-	}()
-
-	// execute backup restore
+	// Start the backup restore. The goroutine is launched only after these calls
+	// succeed so that a failure here does not leave completeBackupRestore blocked
+	// forever in waitForRestoreComplete (goroutine leak).
 	if isFullRestore {
 		e.log.Infof("Starting a new full restore for backup %v", backupUrl)
 		if err := e.backupRestore(backupUrl, concurrentLimit); err != nil {
-			return resp, errors.Wrapf(err, "failed to start full backup restore")
+			return resp, nil, errors.Wrapf(err, "failed to start full backup restore")
 		}
 		e.log.Infof("Successfully initiated full restore for %v to %v", backupUrl, e.Name)
 	} else {
 		e.log.Infof("Starting an incremental restore for backup %v", backupUrl)
 		if err := e.backupRestoreIncrementally(backupUrl, lastRestored, concurrentLimit); err != nil {
-			return resp, errors.Wrapf(err, "failed to start incremental backup restore")
+			return resp, nil, errors.Wrapf(err, "failed to start incremental backup restore")
 		}
 		e.log.Infof("Successfully initiated incremental restore for %v to %v", backupUrl, e.Name)
 	}
 
-	return resp, nil
+	// ch is closed when completeBackupRestore finishes (success, error, or cancel).
+	// The caller (EngineFrontend) waits on this channel before tearing down the initiator.
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		if err := e.completeBackupRestore(spdkClient, backupInfo.SnapshotName); err != nil {
+			e.log.WithError(err).Warn("Failed to complete backup restore")
+		}
+	}()
+
+	return resp, ch, nil
 }
 
 func (e *Engine) backupRestorePrepare(spdkClient *spdkclient.Client, backupUrl string, credential map[string]string, superiorPortAllocator *commonbitmap.Bitmap) (
@@ -2042,11 +2096,65 @@ func (e *Engine) backupRestore(backupURL string, concurrentLimit int32) error {
 	})
 }
 
-func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, backupSnapshotName string) (err error) {
-	defer func() {
-		e.log.Infof("Finalizing backup restore state")
-		e.IsRestoring = false
+func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, backupSnapshotName string) (err error) {
+	// waitForRestoreComplete only reads e.restore fields under e.restore.RLock;
+	// no engine lock is needed (and must not be held — SnapshotCreate/Delete acquire it).
+	waitErr := e.waitForRestoreComplete()
 
+	// Acquire the engine lock to mutate shared fields and tear down the temporary
+	// NVMe-TCP target. This runs regardless of success or failure so that the target
+	// is always stopped and the port always released.
+	// The EngineFrontend initiator is still connected at this point;
+	// it will be torn down after doneCh is closed (i.e. after this function returns).
+	e.Lock()
+	e.log.Infof("Finalizing backup restore state")
+
+	if !e.IsRestoring {
+		e.Unlock()
+		return fmt.Errorf("BUG: engine is not being restored")
+	}
+
+	isCanceled := e.restore != nil && e.restore.State == btypes.ProgressStateCanceled
+
+	// Snapshot name recorded by a previous restore cycle (used below once the lock is dropped).
+	oldSnapshotName := ""
+	if e.restore != nil {
+		oldSnapshotName = e.restore.SnapshotName
+	}
+
+	// Clear the endpoint; the EngineFrontend will tear down the initiator after doneCh closes.
+	e.Endpoint = ""
+
+	// Stop the temporary NVMe-TCP target and release its port.
+	if e.Frontend == types.FrontendEmpty {
+		e.log.Infof("Stopping temporary NVMe-TCP target %s after backup restore", e.NvmeTcpTarget.Nqn)
+		if stopErr := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); stopErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(stopErr) {
+			e.log.WithError(stopErr).Warn("Failed to stop exposing bdev after backup restore")
+		}
+		e.NvmeTcpTarget.Nqn = ""
+		e.NvmeTcpTarget.Nguid = ""
+		e.NvmeTcpTarget.IP = ""
+		if relErr := e.releasePorts(e.restore.superiorPortAllocator); relErr != nil {
+			e.log.WithError(relErr).Warn("Failed to release ports after backup restore")
+		}
+	}
+
+	e.Unlock()
+
+	if waitErr != nil {
+		e.Lock()
+		e.IsRestoring = false
+		if e.restore != nil {
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, waitErr)
+		}
+		e.Unlock()
+		return errors.Wrapf(waitErr, "failed to wait for engine restore complete")
+	}
+
+	// Finalize restore state under the engine lock after snapshot operations complete.
+	defer func() {
+		e.Lock()
+		e.IsRestoring = false
 		if e.restore != nil {
 			if err != nil {
 				e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, err)
@@ -2054,65 +2162,43 @@ func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, superiorPo
 				e.restore.FinishRestore()
 			}
 		}
+		e.Unlock()
 	}()
 
-	if !e.IsRestoring {
-		return fmt.Errorf("BUG: engine is not being restored")
-	}
-
-	if err := e.waitForRestoreComplete(); err != nil {
-		return errors.Wrapf(err, "failed to wait for engine restore complete")
-	}
-
-	// TODO: Move frontend handling out of EngineRestore.
-	// In the future, the engine frontend and engine resource will be separated.
-	e.log.Infof("Disconnecting NVMe-TCP target %s after restore", e.restore.TargetAddress)
-	if err := e.disconnectTarget(e.restore.TargetAddress); err != nil {
-		e.log.WithError(err).Warn("Failed to disconnect NVMe-TCP target after restore")
-	}
-
-	if err := spdkClient.StopExposeBdev(e.NvmeTcpFrontend.Nqn); err != nil {
-		e.log.WithError(err).Warnf("Failed to stop exposing bdev for NVMe-TCP frontend nqn %s after restore", e.NvmeTcpFrontend.Nqn)
-	}
-
-	if err := e.releasePorts(superiorPortAllocator); err != nil {
-		e.log.WithError(err).Warn("Failed to release ports after restore")
-	}
-
-	// Clear frontend-related fields after restore is completed.
-	e.Endpoint = ""
-	e.NvmeTcpFrontend.Port = 0
-	e.initiator = nil
-
-	if e.restore.State == btypes.ProgressStateCanceled {
+	if isCanceled {
 		e.log.Info("Doing nothing for canceled backup restoration")
 		return nil
 	}
 
-	// Delete previous snapshot after restore if exist
-	oldSnapshotName := e.restore.SnapshotName
+	// Delete previous snapshot after restore if it exists.
+	// SnapshotDelete acquires e.Lock() internally.
 	if oldSnapshotName != "" {
-		if _, exists := e.SnapshotMap[oldSnapshotName]; exists {
+		e.RLock()
+		_, snapshotExists := e.SnapshotMap[oldSnapshotName]
+		e.RUnlock()
+		if snapshotExists {
 			e.log.Infof("Deleting existing snapshot %v of the restored volume", oldSnapshotName)
-			err := e.SnapshotDelete(spdkClient, oldSnapshotName)
-			if err != nil {
-				e.log.WithError(err).Warnf("Failed to delete existing snapshot %v of the restored volume", oldSnapshotName)
+			if delErr := e.SnapshotDelete(spdkClient, oldSnapshotName); delErr != nil {
+				e.log.WithError(delErr).Warnf("Failed to delete existing snapshot %v of the restored volume", oldSnapshotName)
 				return nil
 			}
 		}
 	}
 
 	// Prefer using the backup source snapshot name for better traceability.
-	// Fall back to a UUID-based snapshot name if it is not available.
+	// Fall back to a UUID-based name if it is not available.
+	// SnapshotCreate acquires e.Lock() internally.
 	var newSnapshotName string
-
 	if backupSnapshotName == "" {
 		newSnapshotName = fmt.Sprintf("restore-%s", util.UUID())
 	} else {
 		newSnapshotName = fmt.Sprintf("restore-%s", backupSnapshotName)
 
 		// Avoid conflict if the snapshot already exists.
-		if _, exists := e.SnapshotMap[newSnapshotName]; exists {
+		e.RLock()
+		_, exists := e.SnapshotMap[newSnapshotName]
+		e.RUnlock()
+		if exists {
 			suffix := util.UUID()[:5]
 			e.log.Warnf("Snapshot %v already exists, generating a unique restored snapshot name", newSnapshotName)
 			newSnapshotName = fmt.Sprintf("restore-%s-%s", backupSnapshotName, suffix)
@@ -2120,13 +2206,15 @@ func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, superiorPo
 	}
 
 	e.log.Infof("Creating snapshot %v for the restored volume", newSnapshotName)
-	if _, err := e.SnapshotCreate(spdkClient, newSnapshotName); err != nil {
-		e.log.WithError(err).Warnf("Failed to create snapshot %v for the restored volume", newSnapshotName)
+	if _, createErr := e.SnapshotCreate(spdkClient, newSnapshotName); createErr != nil {
+		e.log.WithError(createErr).Warnf("Failed to create snapshot %v for the restored volume", newSnapshotName)
 		return nil
 	}
 
+	e.restore.Lock()
 	e.restore.SnapshotName = newSnapshotName
-	e.log.Infof("Successfully created restored snapshot %v", e.restore.SnapshotName)
+	e.restore.Unlock()
+	e.log.Infof("Successfully created restored snapshot %v", newSnapshotName)
 
 	return nil
 }
@@ -2134,7 +2222,7 @@ func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, superiorPo
 func (e *Engine) waitForRestoreComplete() error {
 	e.log.Info("Waiting for restore to complete")
 
-	err := retry.Do(
+	err := retrygo.Do(
 		func() error {
 			e.restore.RLock()
 			restoreProgress := e.restore.Progress
@@ -2157,15 +2245,15 @@ func (e *Engine) waitForRestoreComplete() error {
 			if restoreError != "" {
 				err := fmt.Errorf("%v", restoreError)
 				e.log.WithError(err).Error("Found backup restoration error")
-				return retry.Unrecoverable(err)
+				return retrygo.Unrecoverable(err)
 			}
 
 			return fmt.Errorf("restore is still in progress")
 		},
-		retry.Delay(restorePeriodicRefreshInterval),
-		retry.MaxDelay(restorePeriodicRefreshInterval),
-		retry.DelayType(retry.FixedDelay),
-		retry.Attempts(0), // retry forever until success or unrecoverable error
+		retrygo.Delay(restorePeriodicRefreshInterval),
+		retrygo.MaxDelay(restorePeriodicRefreshInterval),
+		retrygo.DelayType(retrygo.FixedDelay),
+		retrygo.Attempts(0), // retry forever until success or unrecoverable error
 	)
 
 	if err != nil {
@@ -2187,7 +2275,7 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 	if e.restore == nil {
 		resp.Status[e.Name] = &spdkrpc.ReplicaRestoreStatusResponse{
 			ReplicaName:    e.Name,
-			ReplicaAddress: fmt.Sprintf("%s:%d", e.NvmeTcpFrontend.TargetIP, 0), // fallback
+			ReplicaAddress: fmt.Sprintf("%s:%d", e.NvmeTcpTarget.IP, 0), // fallback
 			IsRestoring:    false,
 		}
 		return resp, nil
@@ -2203,7 +2291,7 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 
 		resp.Status[replicaStatus.Address] = &spdkrpc.ReplicaRestoreStatusResponse{
 			ReplicaName:            replicaName,
-			ReplicaAddress:         fmt.Sprintf("tcp://%s", replicaStatus.Address),
+			ReplicaAddress:         GetBackendReplicaURL(replicaStatus.Address),
 			IsRestoring:            e.IsRestoring,
 			LastRestored:           e.restore.LastRestored,
 			Progress:               int32(e.restore.Progress),
@@ -3129,4 +3217,8 @@ func (e *Engine) SetFinishPhase2Hook(hook func()) {
 	e.Lock()
 	defer e.Unlock()
 	e.finishPhase2Hook = hook
+}
+
+func GetBackendReplicaURL(address string) string {
+	return "tcp://" + address
 }

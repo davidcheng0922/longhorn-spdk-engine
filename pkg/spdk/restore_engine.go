@@ -22,6 +22,7 @@ type EngineRestore struct {
 
 	spdkClient *spdkclient.Client
 	engine     *Engine
+	endpoint   string
 
 	Progress  int
 	Error     string
@@ -30,8 +31,6 @@ type EngineRestore struct {
 
 	// The snapshot file that stores the restored data in the end.
 	SnapshotName string
-
-	TargetAddress string
 
 	superiorPortAllocator *commonbitmap.Bitmap
 
@@ -48,9 +47,8 @@ var _ backupstore.DeltaRestoreOperations = (*EngineRestore)(nil)
 
 func NewEngineRestore(spdkClient *spdkclient.Client, backupURL string, backupName string, engine *Engine, superiorPortAllocator *commonbitmap.Bitmap) *EngineRestore {
 	log := logrus.WithFields(logrus.Fields{
-		"targetAddress": engine.restore.TargetAddress,
-		"backupURL":     backupURL,
-		"backupName":    backupName,
+		"backupURL":  backupURL,
+		"backupName": backupName,
 	})
 
 	return &EngineRestore{
@@ -58,7 +56,6 @@ func NewEngineRestore(spdkClient *spdkclient.Client, backupURL string, backupNam
 		engine:                 engine,
 		BackupURL:              backupURL,
 		CurrentRestoringBackup: backupName,
-		TargetAddress:          engine.restore.TargetAddress,
 		superiorPortAllocator:  superiorPortAllocator,
 		State:                  btypes.ProgressStateInProgress,
 		Progress:               0,
@@ -92,7 +89,6 @@ func (r *EngineRestore) DeepCopy() *EngineRestore {
 		CurrentRestoringBackup: r.CurrentRestoringBackup,
 		LastRestored:           r.LastRestored,
 		SnapshotName:           r.SnapshotName,
-		TargetAddress:          r.TargetAddress,
 		superiorPortAllocator:  r.superiorPortAllocator,
 		State:                  r.State,
 		Error:                  r.Error,
@@ -101,12 +97,14 @@ func (r *EngineRestore) DeepCopy() *EngineRestore {
 }
 
 func (r *EngineRestore) OpenVolumeDev(_ string) (*os.File, string, error) {
-	r.log.Infof("Opening NVMe device %v", r.engine.initiator.Endpoint)
-	fh, err := os.OpenFile(r.engine.initiator.Endpoint, os.O_RDWR|syscall.O_DIRECT, 0666)
+	endpoint := r.endpoint
+
+	r.log.Infof("Opening NVMe device %v", endpoint)
+	fh, err := os.OpenFile(endpoint, os.O_RDWR|syscall.O_DIRECT, 0666)
 	if err != nil {
-		return nil, "", errors.Wrapf(err, "failed to open NVMe device %v", r.engine.initiator.Endpoint)
+		return nil, "", errors.Wrapf(err, "failed to open NVMe device %v", endpoint)
 	}
-	return fh, r.engine.initiator.Endpoint, nil
+	return fh, endpoint, nil
 }
 
 func (r *EngineRestore) CloseVolumeDev(volDev *os.File) error {

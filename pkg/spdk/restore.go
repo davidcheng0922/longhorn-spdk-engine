@@ -13,8 +13,6 @@ import (
 	"github.com/longhorn/backupstore"
 	"github.com/longhorn/go-spdk-helper/pkg/initiator"
 
-	"github.com/longhorn/go-spdk-helper/pkg/initiator"
-
 	btypes "github.com/longhorn/backupstore/types"
 	commonns "github.com/longhorn/go-common-libs/ns"
 	commontypes "github.com/longhorn/go-common-libs/types"

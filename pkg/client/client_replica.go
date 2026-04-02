@@ -686,7 +686,6 @@ func (c *SPDKClient) ReplicaBackupRestore(req *BackupRestoreRequest) error {
 	_, err := client.ReplicaBackupRestore(ctx, &spdkrpc.ReplicaBackupRestoreRequest{
 		BackupUrl:       req.BackupUrl,
 		ReplicaName:     req.ReplicaName,
-		SnapshotName:    req.SnapshotName,
 		Credential:      req.Credential,
 		ConcurrentLimit: req.ConcurrentLimit,
 	})
