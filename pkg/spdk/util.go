@@ -16,7 +16,6 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 
 	commonns "github.com/longhorn/go-common-libs/ns"
-	commontypes "github.com/longhorn/go-common-libs/types"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
@@ -24,10 +23,14 @@ import (
 )
 
 func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, retryInterval time.Duration) (subsystemNQN, controllerName string, err error) {
-	executor, err := helperutil.NewExecutor(commontypes.ProcDirectory)
+	nvmeCliClient, err := initiator.NewGRPCNvmeCliClient("")
 	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to create executor")
+		return "", "", errors.Wrap(err, "failed to create NVMe CLI agent client")
 	}
+	defer nvmeCliClient.Close()
+
+	initiatorName := "longhorn-spdk-engine"
+	portStr := strconv.Itoa(int(srcPort))
 
 	err = retry.New(
 		retry.Attempts(uint(maxRetries)),
@@ -43,12 +46,12 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	).Do(
 		func() error {
 			var e error
-			subsystemNQN, e = initiator.DiscoverTarget(srcIP, strconv.Itoa(int(srcPort)), executor)
+			subsystemNQN, e = nvmeCliClient.DiscoverTarget(initiatorName, srcIP, portStr)
 			if e != nil {
 				return errors.Wrapf(e, "discover target %s:%d failed", srcIP, srcPort)
 			}
 
-			controllerName, e = initiator.ConnectTarget(srcIP, strconv.Itoa(int(srcPort)), subsystemNQN, executor)
+			controllerName, e = nvmeCliClient.ConnectTarget(initiatorName, srcIP, portStr, subsystemNQN, true)
 			if e != nil {
 				return errors.Wrapf(e, "connect target %s:%d (nqn=%s) failed", srcIP, srcPort, subsystemNQN)
 			}
@@ -79,15 +82,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	nvmeCliClient, err := initiator.NewGRPCNvmeCliClient("")
+	if err != nil {
+		return "", "", errors.Wrap(err, "failed to create NVMe CLI agent client")
+	}
+	defer nvmeCliClient.Close()
+
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = nvmeCliClient.DiscoverTarget(lvolName, ip, portStr)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = nvmeCliClient.ConnectTarget(lvolName, ip, portStr, subsystemNQN, true)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)

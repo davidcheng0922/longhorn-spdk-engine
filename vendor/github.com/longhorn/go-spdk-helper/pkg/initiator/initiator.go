@@ -200,7 +200,11 @@ func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return DiscoverTarget(ip, port, i.executor)
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return "", err
+	}
+	return nvmeCliClient.DiscoverTarget(i.Name, ip, port)
 }
 
 // ConnectNVMeTCPTarget connects to a target
@@ -213,7 +217,11 @@ func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return ConnectTarget(ip, port, nqn, i.executor)
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return "", err
+	}
+	return nvmeCliClient.ConnectTarget(i.Name, ip, port, nqn, true)
 }
 
 // executeNVMeTCPPathOp validates initiator state, acquires the file lock, and
@@ -271,7 +279,11 @@ func (i *Initiator) DisconnectNVMeTCPTarget() error {
 		defer lock.Unlock()
 	}
 
-	return DisconnectTarget(i.NVMeTCPInfo.SubsystemNQN, i.executor)
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return err
+	}
+	return nvmeCliClient.DisconnectTarget(i.Name, i.NVMeTCPInfo.SubsystemNQN)
 }
 
 func (i *Initiator) connectNVMeTCPPathWithoutLock(transportAddress, transportServiceID string) error {
@@ -824,7 +836,12 @@ func (i *Initiator) ensureNVMeTCPPathWithoutLock(transportAddress, transportServ
 
 	cleanupConnection := func(reason error) {
 		i.logger.WithError(reason).Warnf("Cleaning up orphaned NVMe/TCP connection for %s at %s:%s after post-connect failure", subsystemNQN, transportAddress, transportServiceID)
-		if disconnectErr := DisconnectController(subsystemNQN, transportAddress, transportServiceID, i.executor); disconnectErr != nil {
+		nvmeCliClient, err := getNvmeCliClient()
+		if err != nil {
+			i.logger.WithError(err).Warn("Failed to create NVMe CLI client for orphaned NVMe/TCP controller cleanup")
+			return
+		}
+		if disconnectErr := nvmeCliClient.DisconnectController(i.Name, subsystemNQN, transportAddress, transportServiceID); disconnectErr != nil {
 			i.logger.WithError(disconnectErr).Warnf("Failed to disconnect orphaned NVMe/TCP controller for %s at %s:%s", subsystemNQN, transportAddress, transportServiceID)
 		}
 	}
@@ -867,6 +884,10 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 	if i.NVMeTCPInfo == nil {
 		return "", "", fmt.Errorf("nvmeTCPInfo is nil")
 	}
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return "", "", err
+	}
 
 	err = retry.Do(
 		func() error {
@@ -883,14 +904,14 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 					subsystemNQN, transportAddress, transportServiceID)
 			} else {
 				i.logger.Infof("Discovering NVMe/TCP target %s:%s", transportAddress, transportServiceID)
-				subsystemNQN, e = DiscoverTarget(transportAddress, transportServiceID, i.executor)
+				subsystemNQN, e = nvmeCliClient.DiscoverTarget(i.Name, transportAddress, transportServiceID)
 				if e != nil {
 					return errors.Wrapf(e, "discover NVMe/TCP target %s:%s failed", transportAddress, transportServiceID)
 				}
 			}
 
 			i.logger.Infof("Connecting to NVMe/TCP target %s:%s with subsystemNQN %s", transportAddress, transportServiceID, subsystemNQN)
-			controllerName, e = ConnectTarget(transportAddress, transportServiceID, subsystemNQN, i.executor)
+			controllerName, e = nvmeCliClient.ConnectTarget(i.Name, transportAddress, transportServiceID, subsystemNQN, true)
 			if e != nil {
 				// "already connected" means the path is present in the kernel
 				// but GetDevices() couldn't find a namespace device yet (e.g.
@@ -935,7 +956,11 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 // when ConnectTarget reports "already connected" but GetDevices cannot find
 // a namespace device (e.g. multipath ANA inaccessible state).
 func (i *Initiator) findControllerBySubsystem(nqn, transportAddress, transportServiceID string) (string, error) {
-	subsystems, err := GetSubsystems(i.executor)
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return "", err
+	}
+	subsystems, err := nvmeCliClient.GetSubsystems(i.Name)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to list subsystems")
 	}
@@ -1001,7 +1026,11 @@ func (i *Initiator) stopWithoutLock(spdkClient *client.Client, dmDeviceAndEndpoi
 
 	// stopping NvmeTcp initiator
 	if i.NVMeTCPInfo != nil {
-		err = DisconnectTarget(i.NVMeTCPInfo.SubsystemNQN, i.executor)
+		nvmeCliClient, clientErr := getNvmeCliClient()
+		if clientErr != nil {
+			return dmDeviceIsBusy, clientErr
+		}
+		err = nvmeCliClient.DisconnectTarget(i.Name, i.NVMeTCPInfo.SubsystemNQN)
 		if err != nil {
 			return dmDeviceIsBusy, errors.Wrapf(err, "failed to disconnect target for NVMe/TCP initiator %s", i.Name)
 		}
@@ -1081,7 +1110,11 @@ func (i *Initiator) WaitForControllerLive(transportAddress, transportServiceID s
 
 	err := retry.Do(
 		func() error {
-			subsystems, err := GetSubsystems(i.executor)
+			nvmeCliClient, err := getNvmeCliClient()
+			if err != nil {
+				return err
+			}
+			subsystems, err := nvmeCliClient.GetSubsystems(i.Name)
 			if err != nil {
 				return errors.Wrap(err, "failed to list subsystems while waiting for controller live state")
 			}
@@ -1141,7 +1174,11 @@ func (i *Initiator) loadNVMeDeviceInfoWithoutLock(transportAddress, transportSer
 	if i.NVMeTCPInfo == nil {
 		return fmt.Errorf("failed to loadNVMeDeviceInfoWithoutLock because nvmeTCPInfo is nil")
 	}
-	nvmeDevices, err := GetDevices(transportAddress, transportServiceID, subsystemNQN, i.executor)
+	nvmeCliClient, err := getNvmeCliClient()
+	if err != nil {
+		return err
+	}
+	nvmeDevices, err := nvmeCliClient.GetDevices(i.Name, transportAddress, transportServiceID, subsystemNQN)
 	if err != nil {
 		return err
 	}
