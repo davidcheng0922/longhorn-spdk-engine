@@ -39,8 +39,9 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	}
 
 	if e == nil {
-		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount, s.newServiceClient)
-		e = s.engineMap[req.Name]
+		e = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount, s.newServiceClient,
+			req.SharedBlock)
+		s.engineMap[req.Name] = e
 	}
 
 	spdkClient := s.spdkClient
@@ -718,6 +719,7 @@ func (s *Server) EngineBackupRestore(ctx context.Context, req *spdkrpc.EngineBac
 		types.DefaultUblkNumberOfQueue,
 		throwawayUpdateCh,
 		s.newServiceClient,
+		false,
 	)
 
 	logrus.WithFields(logrus.Fields{

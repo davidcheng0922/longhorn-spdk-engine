@@ -43,6 +43,13 @@ type EngineFrontend struct {
 	Frontend string
 	Endpoint string
 
+	// SharedBlock indicates the engine target is shared with engine frontends
+	// on other nodes (RWX block volume). Only the NVMe/TCP blockdev frontend and
+	// the empty frontend of the maintenance mode are supported, and target
+	// switchover is rejected because its ANA state changes would affect the
+	// other hosts.
+	SharedBlock bool
+
 	// EngineIP is the IP address of the node running the engine's SPDK service.
 	// It is set during Create for all frontend types (including FrontendEmpty)
 	// and used to derive the gRPC service address for engine operations like
@@ -244,7 +251,7 @@ func getUblkNumberOfQueue(ublkNumberOfQueue int32) int32 {
 }
 
 func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend string, specSize uint64, ublkQueueDepth, ublkNumberOfQueue int32,
-	engineFrontendUpdateCh chan interface{}, newServiceClient ServiceClientFactory) *EngineFrontend {
+	engineFrontendUpdateCh chan interface{}, newServiceClient ServiceClientFactory, sharedBlock bool) *EngineFrontend {
 	if newServiceClient == nil {
 		newServiceClient = GetServiceClient
 	}
@@ -255,6 +262,7 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		"volumeName":         volumeName,
 		"frontend":           frontend,
 		"specSize":           specSize,
+		"sharedBlock":        sharedBlock,
 	})
 
 	if types.IsUblkFrontend(frontend) {
@@ -276,7 +284,7 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		UblkNumberOfQueue: getUblkNumberOfQueue(ublkNumberOfQueue),
 	}
 
-	return &EngineFrontend{
+	ef := &EngineFrontend{
 		Name:        engineFrontendName,
 		EngineName:  engineName,
 		VolumeName:  volumeName,
@@ -285,6 +293,8 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		SpecSize:    specSize,
 
 		Frontend: frontend,
+
+		SharedBlock: sharedBlock,
 
 		NvmeTcpFrontend: nvmeTcpFrontend,
 		NvmeTCPPathMap:  map[string]*NvmeTCPPath{},
@@ -299,6 +309,7 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 
 		newServiceClient: newServiceClient,
 	}
+	return ef
 }
 
 func getStableVolumeNQN(volumeName string) string {
@@ -832,6 +843,11 @@ func (ef *EngineFrontend) Delete(spdkClient *spdkclient.Client) (err error) {
 }
 
 func (ef *EngineFrontend) handleFrontend(spdkClient *spdkclient.Client, targetAddress string) (err error) {
+	// An empty frontend is the maintenance mode, which connects no host.
+	if ef.SharedBlock && ef.Frontend != types.FrontendSPDKTCPBlockdev && ef.Frontend != types.FrontendEmpty {
+		return fmt.Errorf("frontend %s is not supported for shared block engine frontend %s", ef.Frontend, ef.Name)
+	}
+
 	switch ef.Frontend {
 	case types.FrontendEmpty:
 		ef.log.Info("No frontend specified, will not expose bdev for engine")
@@ -975,6 +991,8 @@ func (ef *EngineFrontend) getWithoutLock() (res *spdkrpc.EngineFrontend) {
 		ActualSize: ef.ActualSize,
 		Frontend:   ef.Frontend,
 		Endpoint:   ef.Endpoint,
+
+		SharedBlock: ef.SharedBlock,
 
 		State:                 string(ef.State),
 		ErrorMsg:              ef.ErrorMsg,
@@ -1537,6 +1555,9 @@ func (ef *EngineFrontend) Resume(_ *spdkclient.Client) (err error) {
 // suspend/resume separately.
 // If newEngineName is empty, the function will try to resolve it via targetAddress.
 func (ef *EngineFrontend) SwitchOverTarget(spdkClient *spdkclient.Client, newEngineName, targetAddress, switchoverPhase string) (err error) {
+	if ef.SharedBlock {
+		return errors.Wrapf(ErrSwitchOverTargetInvalidInput, "target switchover is not supported for shared block engine frontend %s", ef.Name)
+	}
 	if targetAddress == "" {
 		return errors.Wrapf(ErrSwitchOverTargetInvalidInput, "target address is required for engine frontend %s switchover", ef.Name)
 	}
