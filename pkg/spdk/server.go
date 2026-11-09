@@ -238,6 +238,12 @@ func (s *Server) tryEnsureSPDKTgtConnectionHealthy() error {
 	return s.clientReconnect()
 }
 
+func (s *Server) getSPDKClient() *spdkclient.Client {
+	s.RLock()
+	defer s.RUnlock()
+	return s.spdkClient
+}
+
 func (s *Server) clientReconnect() error {
 	s.Lock()
 	defer func() {

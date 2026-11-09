@@ -19,6 +19,7 @@ import (
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
+	commonnet "github.com/longhorn/go-common-libs/net"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
 
@@ -167,6 +168,10 @@ const (
 	// alternates between reading the device and failing on it, so a single good
 	// read is not recovery and must not put the deadline out of reach.
 	transientDeviceStateClearInterval = 30 * time.Second
+
+	// sharedBlockRegisterInterval is how often a running shared block engine
+	// frontend registers to the engine again.
+	sharedBlockRegisterInterval = 30 * time.Second
 )
 
 const (
@@ -308,6 +313,9 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		log:      safelog.NewSafeLogger(log),
 
 		newServiceClient: newServiceClient,
+	}
+	if sharedBlock {
+		go ef.keepRegisteredToEngine()
 	}
 	return ef
 }
@@ -954,6 +962,12 @@ func (ef *EngineFrontend) createNvmeTcpFrontend(spdkClient *spdkclient.Client, t
 	disconnectTarget := !ef.isExpanding
 	ef.RUnlock()
 
+	if ef.SharedBlock {
+		if err := ef.registerToEngine(i); err != nil {
+			return errors.Wrapf(err, "failed to register engine frontend %v to engine before connecting", ef.Name)
+		}
+	}
+
 	dmDeviceIsBusy, err = i.StartNvmeTCPInitiator(targetIP, strconv.Itoa(int(targetPort)), true, disconnectTarget)
 	if err != nil {
 		return errors.Wrapf(err, "failed to start NVMe/TCP initiator for engine frontend %v", ef.Name)
@@ -984,6 +998,65 @@ func (ef *EngineFrontend) getEngineServiceAddress() string {
 		return ""
 	}
 	return net.JoinHostPort(ef.EngineIP, strconv.Itoa(types.SPDKServicePort))
+}
+
+// registerToEngine registers the shared block engine frontend to the engine,
+// so that the engine can suspend it.
+func (ef *EngineFrontend) registerToEngine(i *initiator.Initiator) error {
+	ef.RLock()
+	engineName := ef.EngineName
+	engineAddress := ef.getEngineServiceAddress()
+	ef.RUnlock()
+
+	hostNQN, err := i.GetHostNQN()
+	if err != nil {
+		return errors.Wrap(err, "failed to get host NQN")
+	}
+	localIP, err := commonnet.GetPreferredPodIP()
+	if err != nil {
+		return errors.Wrap(err, "failed to get local IP")
+	}
+	address := net.JoinHostPort(localIP, strconv.Itoa(types.SPDKServicePort))
+
+	engineClient, err := ef.newServiceClient(engineAddress)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get SPDK client for engine %s at %s", engineName, engineAddress)
+	}
+	defer func() {
+		if errClose := engineClient.Close(); errClose != nil {
+			ef.log.WithError(errClose).Warn("Failed to close engine SPDK client")
+		}
+	}()
+
+	return engineClient.EngineRegisterFrontend(engineName, ef.Name, address, hostNQN)
+}
+
+// keepRegisteredToEngine periodically registers the running shared block
+// engine frontend to the engine again, so that the registration survives an
+// engine restart and follows an address change of this engine frontend.
+func (ef *EngineFrontend) keepRegisteredToEngine() {
+	ticker := time.NewTicker(sharedBlockRegisterInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ef.stopCh:
+			return
+		case <-ticker.C:
+		}
+
+		ef.RLock()
+		i := ef.initiator
+		ready := ef.State == types.InstanceStateRunning && !ef.isCreating && ef.Frontend == types.FrontendSPDKTCPBlockdev && i != nil
+		ef.RUnlock()
+		if !ready {
+			continue
+		}
+
+		if err := ef.registerToEngine(i); err != nil {
+			ef.log.WithError(err).Warn("Failed to register engine frontend to engine")
+		}
+	}
 }
 
 func (ef *EngineFrontend) getWithoutLock() (res *spdkrpc.EngineFrontend) {
@@ -1482,6 +1555,12 @@ func (ef *EngineFrontend) SuspendWithOptions(_ *spdkclient.Client, noFlush, noLo
 	}
 	if ef.isSwitchingOver {
 		return errors.Wrapf(ErrSwitchOverTargetPrecondition, "engine frontend %s is switching over target", ef.Name)
+	}
+	// A shared block engine frontend registers to the engine before it connects
+	// to the engine target, so the engine may suspend it while it is creating.
+	// Fail the suspension, as the engine frontend can connect after it.
+	if ef.SharedBlock && ef.isCreating {
+		return errors.Wrapf(ErrEngineFrontendLifecyclePrecondition, "engine frontend %s is creating", ef.Name)
 	}
 
 	ef.log.Info("Suspending engine frontend")
@@ -2458,6 +2537,15 @@ func (ef *EngineFrontend) snapshotOperation(inputSnapshotName string, snapshotOp
 		ef.Unlock()
 		return "", errors.Wrapf(ErrSwitchOverTargetPrecondition, "engine frontend %s is switching over target", ef.Name)
 	}
+	// A shared block engine suspends the other engine frontends only, so the
+	// requesting one must suspend itself. Otherwise the engine would try to
+	// suspend it while it holds its lock here. An empty frontend (maintenance
+	// mode) connects no host and never registers, so it needs no suspension.
+	if ef.SharedBlock && snapshotOp == SnapshotOperationCreate && ef.Frontend != types.FrontendEmpty &&
+		(ef.State != types.InstanceStateRunning || !ef.isSuspendSupported()) {
+		ef.Unlock()
+		return "", errors.Wrapf(ErrEngineFrontendLifecyclePrecondition, "engine frontend %s must be running with a suspendable frontend to create a snapshot of a shared block volume", ef.Name)
+	}
 
 	defer func() {
 		ef.Unlock()
@@ -2484,6 +2572,10 @@ func (ef *EngineFrontend) snapshotOperation(inputSnapshotName string, snapshotOp
 		}
 	}()
 
+	// suspendedFrontendName tells the engine that this engine frontend has
+	// suspended itself, so a shared block engine does not suspend it again.
+	suspendedFrontendName := ""
+
 	// Pause the IO, flush outstanding IO and attempt to synchronize filesystem by suspending the NVMe initiator
 	if snapshotOp == SnapshotOperationCreate {
 		if ef.isSuspendSupported() {
@@ -2491,6 +2583,7 @@ func (ef *EngineFrontend) snapshotOperation(inputSnapshotName string, snapshotOp
 			if err := ef.suspend(false, false); err != nil {
 				return "", errors.Wrapf(err, "failed to suspend before the snapshot operation %s for snapshot %q", snapshotOp, inputSnapshotName)
 			}
+			suspendedFrontendName = ef.Name
 			defer func() {
 				ef.log.Infof("Resuming after the snapshot operation %s for snapshot %s", snapshotOp, inputSnapshotName)
 				if resumeErr := ef.resume(); resumeErr != nil {
@@ -2514,7 +2607,7 @@ func (ef *EngineFrontend) snapshotOperation(inputSnapshotName string, snapshotOp
 
 	switch snapshotOp {
 	case SnapshotOperationCreate:
-		return engineSpdkClient.EngineSnapshotCreate(ef.EngineName, inputSnapshotName)
+		return engineSpdkClient.EngineSnapshotCreate(ef.EngineName, inputSnapshotName, suspendedFrontendName)
 	case SnapshotOperationDelete:
 		return "", engineSpdkClient.EngineSnapshotDelete(ef.EngineName, inputSnapshotName)
 	case SnapshotOperationRevert:

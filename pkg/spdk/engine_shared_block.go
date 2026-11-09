@@ -7,12 +7,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
+
+	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 )
+
+// ErrSharedBlockFrontendsFreezing is returned when an engine frontend cannot
+// register, or another operation cannot suspend the engine frontends, because
+// the engine frontends of the shared block engine are being suspended.
+var ErrSharedBlockFrontendsFreezing = errors.New("engine frontends of the shared block engine are being suspended")
 
 // sharedBlockEngineState is the state of a shared block engine.
 type sharedBlockEngineState struct {
@@ -33,6 +43,91 @@ type sharedBlockEngineState struct {
 	// the maintenance mode, where reporting the missing file as an empty state
 	// would overwrite the synced state.
 	reservationPrepared bool
+
+	// frontends has its own lock, as the engine lock is not held while the
+	// engine calls the engine frontends.
+	frontends sharedBlockFrontends
+}
+
+type registeredFrontend struct {
+	address string
+	hostNQN string
+}
+
+// sharedBlockFrontends tracks how to suspend each engine frontend of a shared
+// block engine, so that the engine can suspend the frontends on all hosts before
+// an operation that requires no I/O.
+type sharedBlockFrontends struct {
+	sync.Mutex
+
+	// registered maps the name of each engine frontend to how to suspend it.
+	registered map[string]*registeredFrontend
+	isFreezing bool
+}
+
+// register records the engine frontend, and returns whether it changed. It is
+// rejected while the engine frontends are suspended.
+func (f *sharedBlockFrontends) register(name, address, hostNQN string) (changed bool, err error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.isFreezing {
+		return false, ErrSharedBlockFrontendsFreezing
+	}
+	if f.registered == nil {
+		f.registered = map[string]*registeredFrontend{}
+	}
+	old := f.registered[name]
+	changed = old == nil || old.address != address || old.hostNQN != hostNQN
+	f.registered[name] = &registeredFrontend{address: address, hostNQN: hostNQN}
+	return changed, nil
+}
+
+// startFreezing marks the engine frontends as being suspended, and returns a
+// copy of the registered engine frontends.
+func (f *sharedBlockFrontends) startFreezing() (map[string]*registeredFrontend, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.isFreezing {
+		return nil, ErrSharedBlockFrontendsFreezing
+	}
+	f.isFreezing = true
+
+	frontends := make(map[string]*registeredFrontend, len(f.registered))
+	for name, frontend := range f.registered {
+		frontends[name] = frontend
+	}
+	return frontends, nil
+}
+
+func (f *sharedBlockFrontends) stopFreezing() {
+	f.Lock()
+	defer f.Unlock()
+
+	f.isFreezing = false
+}
+
+func getConnectedHostNQNs(spdkClient *spdkclient.Client, nqn string) (map[string]bool, error) {
+	controllers, err := sharedBlockNvmfSubsystemGetControllers(spdkClient, nqn)
+	if err != nil {
+		return nil, err
+	}
+	hosts := map[string]bool{}
+	for _, controller := range controllers {
+		hosts[controller.Hostnqn] = true
+	}
+	return hosts, nil
+}
+
+// isFrontendGoneError returns true if the engine frontend does not exist or
+// its node cannot be reached.
+func isFrontendGoneError(err error) bool {
+	switch grpcstatus.Code(errors.UnwrapAll(err)) {
+	case grpccodes.NotFound, grpccodes.Unavailable, grpccodes.DeadlineExceeded:
+		return true
+	}
+	return false
 }
 
 // reservationPtplEmptyFileMinAge is how long a ptpl file must have been empty
