@@ -72,10 +72,14 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
 	github.com/slok/goresilience v0.2.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.49.0
 	golang.org/x/text v0.43.0 // indirect; sindirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/mount-utils v0.31.3 // indirect
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd // indirect
 )
+
+replace github.com/longhorn/types => ../types
+
+replace github.com/longhorn/go-spdk-helper => ../go-spdk-helper
