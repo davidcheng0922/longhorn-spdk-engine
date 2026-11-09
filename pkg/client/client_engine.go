@@ -20,7 +20,7 @@ import (
 // DATA_LAYOUT_TYPE_SHARDED constructs a single shardGroupBackend (EC).
 // Without forwarding this field, callers would default to the proto3 zero
 // value (REPLICATED), and EC volumes would be silently miscreated as RAID1.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, snapshotMaxCount int32, dataLayoutType spdkrpc.DataLayoutType, sharedBlock bool) (*api.Engine, error) {
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, snapshotMaxCount int32, dataLayoutType spdkrpc.DataLayoutType, sharedBlock bool, reservation *spdkrpc.ReservationState) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
@@ -46,6 +46,7 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 		SnapshotMaxCount:  snapshotMaxCount,
 		DataLayoutType:    dataLayoutType,
 		SharedBlock:       sharedBlock,
+		Reservation:       reservation,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")

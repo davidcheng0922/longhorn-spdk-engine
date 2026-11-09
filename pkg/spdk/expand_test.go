@@ -22,7 +22,7 @@ import (
 func (s *TestSuite) TestEngineFinishExpansionSuccessClearsErrorState(c *C) {
 	fmt.Println("Testing Engine finish expansion success clears error state")
 
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.State = lhtypes.InstanceStateError
 	e.ErrorMsg = "previous failure"
 
@@ -36,7 +36,7 @@ func (s *TestSuite) TestEngineFinishExpansionSuccessClearsErrorState(c *C) {
 func (s *TestSuite) TestEngineFinishExpansionFailureSetsErrorState(c *C) {
 	fmt.Println("Testing Engine finish expansion failure sets error state")
 
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.State = lhtypes.InstanceStateRunning
 	e.ErrorMsg = ""
 	e.SpecSize = 10
@@ -53,7 +53,7 @@ func (s *TestSuite) TestEngineFinishExpansionFailureSetsErrorState(c *C) {
 func (s *TestSuite) TestEngineFinishExpansionFailureRestoresOriginalSize(c *C) {
 	fmt.Println("Testing Engine finish expansion failure restores original size when spec size was updated during expand")
 
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.SpecSize = 20
 
 	e.finishExpansion(10, 20, errors.New("expand failed"))
@@ -111,7 +111,7 @@ func (s *TestSuite) TestEngineFrontendFinishExpansionFailureWithoutExpansion(c *
 func (s *TestSuite) TestEngineFinishExpansionPartialFailureKeepsOriginalSize(c *C) {
 	fmt.Println("Testing Engine finish expansion partial failure keeps original size")
 
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.lastExpansionError = "replica expand failed"
 
 	e.finishExpansion(10, 20, nil)
@@ -125,7 +125,7 @@ func (s *TestSuite) TestEngineFinishExpansionPartialFailureKeepsOriginalSize(c *
 func (s *TestSuite) TestEngineFinishExpansionPartialFailureRestoresOriginalSize(c *C) {
 	fmt.Println("Testing Engine finish expansion partial failure restores original size when spec size was updated during expand")
 
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.SpecSize = 20
 	e.lastExpansionError = "replica expand failed"
 
@@ -176,12 +176,12 @@ func (s *TestSuite) TestEngineFrontendRequireExpansionGuards(c *C) {
 func (s *TestSuite) TestEngineExpandPrecheckGuards(c *C) {
 	fmt.Println("Testing Engine expand precheck guards")
 
-	eInProgress := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	eInProgress := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	eInProgress.isExpanding = true
 	_, err := eInProgress.ExpandPrecheck(nil, 20)
 	c.Assert(errors.Is(err, ErrExpansionInProgress), Equals, true)
 
-	eRestoring := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	eRestoring := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	eRestoring.IsRestoring = true
 	_, err = eRestoring.ExpandPrecheck(nil, 20)
 	c.Assert(errors.Is(err, ErrRestoringInProgress), Equals, true)
@@ -210,7 +210,7 @@ func (s *TestSuite) TestEngineExpandPrecheck(c *C) {
 	for _, tc := range cases {
 		fmt.Println("Testing ExpandPrecheck:", tc.name)
 
-		e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+		e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 		ups := map[string]Backend{}
 		i := 1
 		for name, spec := range tc.backends {
@@ -241,7 +241,7 @@ func (s *TestSuite) TestEngineExpandPrecheck(c *C) {
 func (s *TestSuite) TestHandleReplicaExpandResult(c *C) {
 	fmt.Println("Testing Engine handle replica expand result")
 
-	eAllFailed := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	eAllFailed := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	replicaClientsAllFailed := map[string]*clientpkg.SPDKClient{
 		"r1": nil,
 		"r2": nil,
@@ -254,7 +254,7 @@ func (s *TestSuite) TestHandleReplicaExpandResult(c *C) {
 	c.Assert(err, NotNil)
 	c.Assert(strings.Contains(err.Error(), "all replicas failed to expand"), Equals, true)
 
-	ePartial := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	ePartial := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	ePartial.backends = map[string]Backend{
 		"r1": newTestReplicaBackend("r1", "", lhtypes.ModeRW),
 		"r2": newTestReplicaBackend("r2", "", lhtypes.ModeRW),
@@ -296,7 +296,7 @@ func (s *TestSuite) TestExpandViaBackendResetGuards(c *C) {
 		fmt.Println("Testing ExpandViaBackendReset:", tc.name)
 
 		// nil spdkClient is safe: every guard path returns before any SPDK call.
-		e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+		e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 		tc.setup(e)
 		sizeBefore := e.SpecSize
 
@@ -399,7 +399,7 @@ func (s *TestSuite) TestEngineExpandPreservesANAState(c *C) {
 
 	// An engine with ANAState=inaccessible (e.g. a switchover target)
 	// should keep that state across Expand, not revert to optimized.
-	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e := NewEngine("engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	e.NvmeTcpTarget.ANAState = NvmeTCPANAStateInaccessible
 
 	// Verify the ANA state is preserved in the logic path that Expand uses.
@@ -413,7 +413,7 @@ func (s *TestSuite) TestEngineExpandPreservesANAState(c *C) {
 	c.Assert(err, IsNil)
 
 	// Verify that an empty ANAState defaults to optimized.
-	e2 := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false)
+	e2 := NewEngine("engine-b", "vol-b", lhtypes.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil, false, "")
 	c.Assert(e2.NvmeTcpTarget.ANAState, Equals, NvmeTCPANAState(""))
 	defaultState := e2.NvmeTcpTarget.ANAState
 	if defaultState == "" {

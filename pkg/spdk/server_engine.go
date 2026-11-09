@@ -40,7 +40,11 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 
 	if e == nil {
 		e = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount, s.newServiceClient,
-			req.SharedBlock)
+			req.SharedBlock, s.metadataDir)
+		if req.SharedBlock && req.Reservation != nil {
+			e.sharedBlockState.reservationEpoch = req.Reservation.Epoch
+			e.sharedBlockState.reservationSeed = req.Reservation
+		}
 		s.engineMap[req.Name] = e
 	}
 
